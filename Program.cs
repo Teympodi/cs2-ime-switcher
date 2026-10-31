@@ -5,7 +5,7 @@ using System.Text.Json;
 namespace ImeSwitcher;
 
 /// <summary>
-/// ImeSwitcher —— 从 SoundViz.Overlay 抽出的独立小工具（v1.1.2）。
+/// ImeSwitcher —— 从 SoundViz.Overlay 抽出的独立小工具（v1.1.3）。
 ///
 /// 职责只有一件事：前台是 cs2 时切到游戏内目标输入法（默认微软拼音），离开 CS2 恢复进入前的输入法。
 ///
@@ -101,7 +101,7 @@ internal static class Program
             }
         };
 
-        Log($"ImeSwitcher v1.1.2 启动：目标进程={TargetProcess}.exe");
+        Log($"ImeSwitcher v1.1.3 启动：目标进程={TargetProcess}.exe");
         Application.Run();
 
         SingleInstance.ReleaseMutex();
@@ -199,6 +199,9 @@ internal sealed class ImeSwitcherCore
     // 进入目标进程时锁定的"用户原本激活的输入法"，用于离开时恢复
     private string? _beforeEnterClsid;
 
+    // 离开恢复后待校验的期望输入法 CLSID（恢复是否真实生效，下一拍复核）
+    private string? _pendingVerifyClsid;
+
     // 游戏内目标输入法（托盘可选，默认微软拼音）
     private LayoutOrTipProfile? _targetProfile;
     private string _targetName = "微软拼音";
@@ -262,14 +265,41 @@ internal sealed class ImeSwitcherCore
             }
             else
             {
-                // 非目标前台：持续记录用户当时激活的输入法，供下次进入时恢复
-                string? activeClsid = GetActiveInputClsid();
-                if (activeClsid != null) _lastNonCs2ActiveClsid = activeClsid;
-
+                // 刚离开目标进程的这一拍：先恢复，且【跳过快照记录】——
+                // 此时系统还停留在被强切的游戏内输入法上，此刻的读数是污染值；
+                // 若记入快照，下次进入会快照到游戏内输入法 → 恢复变"无需切换" → 永久卡死。
+                // （2026-10-31 15:39 事故根因：离开后 417ms 内快速重进，污染快照先于纠偏读入。）
                 if (_inCs2)
                 {
                     _inCs2 = false;
-                    RestoreBeforeEnter();
+                    RestoreBeforeEnter();   // 内部会设置 _lastRestoredClsid
+                }
+                else
+                {
+                    // 非目标前台：持续记录用户当时激活的输入法，供下次进入时恢复
+                    string? activeClsid = GetActiveInputClsid();
+                    if (activeClsid != null)
+                    {
+                        // 恢复后校验（离开后的第一拍）：期望已恢复到原输入法，
+                        // 若系统仍停留在游戏内输入法上，说明恢复未真实生效，补一刀重试。
+                        if (_pendingVerifyClsid != null)
+                        {
+                            string targetClsid = _targetProfile!.Value.Clsid.ToString();
+                            bool stillOnGame = activeClsid.Equals(targetClsid, StringComparison.OrdinalIgnoreCase);
+                            bool expectGame = _pendingVerifyClsid.Equals(targetClsid, StringComparison.OrdinalIgnoreCase);
+                            if (stillOnGame && !expectGame &&
+                                TryFindByClsid(_pendingVerifyClsid, out var again))
+                            {
+                                bool ok2 = ActivateTip(again);
+                                _log($"恢复校验：系统仍在{_targetName}，重试恢复{(ok2 ? "成功" : "失败")}");
+                                // 重试后的读数不可信，本拍跳过快照记录
+                                _pendingVerifyClsid = null;
+                                return;
+                            }
+                            _pendingVerifyClsid = null;
+                        }
+                        _lastNonCs2ActiveClsid = activeClsid;
+                    }
                 }
             }
         }
@@ -465,6 +495,7 @@ internal sealed class ImeSwitcherCore
                     : restore.Clsid.Equals(ClsidWeixin) ? "微信" : restore.Clsid.ToString("B");
                 Status = ok ? $"ImeSwitcher：已恢复 {restoreName}" : "ImeSwitcher：恢复输入法失败";
                 _log($"离开{_targetProcess}：恢复={restoreName} {(ok ? "成功" : "失败")}");
+                _pendingVerifyClsid = ok ? _beforeEnterClsid : null;   // 下一拍复核恢复是否真实生效
             }
             else
             {
