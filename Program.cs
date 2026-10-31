@@ -79,7 +79,29 @@ internal static class Program
         };
         timer.Start();
 
-        Log($"ImeSwitcher v1.1.0 启动：目标进程={TargetProcess}.exe");
+        // 启动气泡：让用户知道工具在哪、怎么用（Win11 默认把托盘新图标藏进 ^ 折叠区）
+        icon.BalloonTipTitle = "ImeSwitcher 已启动";
+        icon.BalloonTipText = "图标在任务栏右下角 ^（隐藏图标）里，可到 设置→个性化→任务栏→其他系统托盘图标 设为常驻显示。" +
+                              $"进入 {TargetProcess} 自动切微软拼音，切出自动恢复原输入法。右键图标可更换游戏内输入法。";
+        icon.ShowBalloonTip(8000);
+
+        // 首次切换生效时弹一次气泡确认；异常时随时弹
+        bool firstSwitchShown = false;
+        switcher.Transitioned += msg =>
+        {
+            bool isError = msg.Contains("失败") || msg.Contains("异常") || msg.Contains("未找到");
+            if (isError)
+            {
+                ShowBalloon(icon, "ImeSwitcher 异常", msg);
+            }
+            else if (!firstSwitchShown && msg.Contains("进入"))
+            {
+                firstSwitchShown = true;
+                ShowBalloon(icon, "ImeSwitcher 已生效", msg);
+            }
+        };
+
+        Log($"ImeSwitcher v1.1.1 启动：目标进程={TargetProcess}.exe");
         Application.Run();
 
         SingleInstance.ReleaseMutex();
@@ -100,6 +122,17 @@ internal static class Program
             item.Click += (_, _) => switcher.SetTarget(profile, name);
             targetMenu.DropDownItems.Add(item);
         }
+    }
+
+    private static void ShowBalloon(NotifyIcon icon, string title, string text)
+    {
+        try
+        {
+            icon.BalloonTipTitle = title;
+            icon.BalloonTipText = text.Length > 250 ? text[..250] : text;
+            icon.ShowBalloonTip(5000);
+        }
+        catch { /* 通知失败不影响主流程 */ }
     }
 
     // ===== 文件日志 =====
@@ -173,6 +206,9 @@ internal sealed class ImeSwitcherCore
     /// <summary>托盘提示用的状态描述。</summary>
     public string Status { get; private set; } = "ImeSwitcher：运行中";
 
+    /// <summary>发生状态切换或异常时触发（供气泡通知）。</summary>
+    public event Action<string>? Transitioned;
+
     public ImeSwitcherCore(string targetProcess, Action<string> log)
     {
         _targetProcess = targetProcess;
@@ -218,6 +254,7 @@ internal sealed class ImeSwitcherCore
                 Status = ok ? $"ImeSwitcher：进入 {_targetProcess} → {_targetName}"
                             : $"ImeSwitcher：切换{_targetName}失败";
                 _log($"进入{_targetProcess}：切{_targetName} {(ok ? "成功" : "失败")}");
+                Transitioned?.Invoke(Status);
             }
             else if (isTarget)
             {
@@ -240,6 +277,7 @@ internal sealed class ImeSwitcherCore
         {
             Status = "ImeSwitcher：异常";
             _log($"异常：{ex.Message}");
+            Transitioned?.Invoke(Status);
         }
     }
 
@@ -403,6 +441,7 @@ internal sealed class ImeSwitcherCore
             _log($"离开{_targetProcess}：无需切换（beforeEnterClsid={(_beforeEnterClsid ?? "null")}）");
         }
         _beforeEnterClsid = null;
+        Transitioned?.Invoke(Status);
     }
 
     // ===== 前台进程识别 =====
