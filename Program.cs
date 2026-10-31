@@ -61,6 +61,8 @@ internal static class Program
         menu.Items.Add(targetMenu);
 
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("关于 ImeSwitcher…", null, (_, _) => ShowAbout());
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出", null, (_, _) =>
         {
             switcher.Disable();     // 若正处于 CS2 切入态，先恢复原输入法再退出
@@ -101,7 +103,7 @@ internal static class Program
             }
         };
 
-        Log($"ImeSwitcher v1.1.3 启动：目标进程={TargetProcess}.exe");
+        Log($"ImeSwitcher v1.2.0 启动：目标进程={TargetProcess}.exe");
         Application.Run();
 
         SingleInstance.ReleaseMutex();
@@ -133,6 +135,21 @@ internal static class Program
             icon.ShowBalloonTip(5000);
         }
         catch { /* 通知失败不影响主流程 */ }
+    }
+
+    /// <summary>关于窗口：显示版本号与工具说明（版本取自程序集，与 csproj 的 Version 单一来源）。</summary>
+    private static void ShowAbout()
+    {
+        var ver = typeof(Program).Assembly.GetName().Version;
+        MessageBox.Show(
+            $"ImeSwitcher v{ver?.ToString(3)}\n\n" +
+            "CS2 输入法自动切换器\n" +
+            $"前台为 {TargetProcess} 时自动切到所选输入法，离开自动恢复原输入法。\n\n" +
+            "技术边界：不注入、不读内存、不 hook、不联网；无覆盖层、无输入监听。\n\n" +
+            "开源地址：github.com/Teympodi/cs2-ime-switcher\n" +
+            @"日志文件：%LOCALAPPDATA%\ImeSwitcher\ime_switch.log",
+            "关于 ImeSwitcher",
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     // ===== 文件日志 =====
