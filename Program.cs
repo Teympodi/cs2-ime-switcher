@@ -5,7 +5,7 @@ using System.Text.Json;
 namespace ImeSwitcher;
 
 /// <summary>
-/// ImeSwitcher —— 从 SoundViz.Overlay 抽出的独立小工具（v1.1.0）。
+/// ImeSwitcher —— 从 SoundViz.Overlay 抽出的独立小工具（v1.1.2）。
 ///
 /// 职责只有一件事：前台是 cs2 时切到游戏内目标输入法（默认微软拼音），离开 CS2 恢复进入前的输入法。
 ///
@@ -101,7 +101,7 @@ internal static class Program
             }
         };
 
-        Log($"ImeSwitcher v1.1.1 启动：目标进程={TargetProcess}.exe");
+        Log($"ImeSwitcher v1.1.2 启动：目标进程={TargetProcess}.exe");
         Application.Run();
 
         SingleInstance.ReleaseMutex();
@@ -391,9 +391,16 @@ internal sealed class ImeSwitcherCore
         }
     }
 
-    /// <summary>取输入法显示名（TSF GetLanguageProfileDescription，槽 10）；失败回退 CLSID 字符串。</summary>
+    /// <summary>
+    /// 取输入法显示名。实测（本机 26200）GetLanguageProfileDescription 对系统 IME 返回 S_OK 但空串，
+    /// 故回退顺序：已知 CLSID 对照表 → COM 描述（部分第三方 IME 有）→ 注册表 CTF\TIP Description → CLSID。
+    /// </summary>
     private static string GetProfileDescription(LayoutOrTipProfile p)
     {
+        // 1) 已知 CLSID 中文对照表（实测确认的常见输入法）
+        if (KnownNames.TryGetValue(p.Clsid.ToString("B"), out var known)) return known;
+
+        // 2) COM GetLanguageProfileDescription（槽 10）
         try
         {
             var profiles = (ITfInputProcessorProfiles)new TfInputProcessorProfiles();
@@ -405,8 +412,38 @@ internal sealed class ImeSwitcherCore
             }
         }
         catch { }
+
+        // 3) 注册表 HKLM/HKCU\SOFTWARE\Microsoft\CTF\TIP\<clsid>\LanguageProfile\0x<len>\<guid> 的 Description
+        try
+        {
+            string keyPath = $@"SOFTWARE\Microsoft\CTF\TIP\{p.Clsid.ToString("B").ToUpperInvariant()}" +
+                             $@"\LanguageProfile\0x{p.LangId:X8}\{p.ProfileGuid.ToString("B").ToUpperInvariant()}";
+            foreach (var hive in new[] { Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryHive.CurrentUser })
+            foreach (var view in new[] { Microsoft.Win32.RegistryView.Registry64, Microsoft.Win32.RegistryView.Registry32 })
+            {
+                try
+                {
+                    using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(hive, view);
+                    using var k = baseKey.OpenSubKey(keyPath);
+                    if (k?.GetValue("Description") is string s && !string.IsNullOrWhiteSpace(s))
+                        return s;
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        // 4) 兜底：CLSID 字符串
         return p.Clsid.ToString("B");
     }
+
+    /// <summary>常见输入法 CLSID → 中文名（实测确认）。</summary>
+    private static readonly Dictionary<string, string> KnownNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}"] = "微软拼音",
+        ["{86598FB9-66A2-463E-B9C2-AEB906D477AD}"] = "微信输入法",
+        ["{6A498709-E00B-4C45-A018-8F9E4081AE40}"] = "微软五笔",
+    };
 
     private string DescribeClsid(string? clsid) =>
         clsid == null ? "英文键盘"

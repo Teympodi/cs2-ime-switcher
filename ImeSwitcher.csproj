@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>ImeSwitcher</AssemblyName>
     <RootNamespace>ImeSwitcher</RootNamespace>
-    <Version>1.1.1</Version>
+    <Version>1.1.2</Version>
     <Product>ImeSwitcher</Product>
     <Description>前台应用输入法自动切换（独立小工具，无音频/无覆盖层/无输入监听）</Description>
     <!-- 单文件发布（依赖本机已装的 .NET 10 桌面运行时） -->
