@@ -1,12 +1,16 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 
 namespace ImeSwitcher;
 
 /// <summary>
-/// ImeSwitcher —— 从 SoundViz.Overlay 抽出的独立小工具（v1.0.0）。
+/// ImeSwitcher —— 从 SoundViz.Overlay 抽出的独立小工具（v1.1.0）。
 ///
-/// 职责只有一件事：前台是 cs2 时切到微软拼音，离开 CS2 恢复进入前的输入法。
+/// 职责只有一件事：前台是 cs2 时切到游戏内目标输入法（默认微软拼音），离开 CS2 恢复进入前的输入法。
+///
+/// 【为什么默认微软拼音】CS2 全屏下只有微软拼音/谷歌拼音能正常弹出候选词，
+/// 第三方输入法（搜狗/QQ拼音/百度等）在游戏内无法显示候选窗。
 ///
 /// 【与 SoundViz 的区别（风控画像考量）】
 ///   - 不含音频采集（无 WASAPI）、无 DirectX/D2D 覆盖层、无 Raw Input 鼠标/键盘监听
@@ -14,7 +18,7 @@ namespace ImeSwitcher;
 ///   - 仅有的系统交互：
 ///       1) GetForegroundWindow + OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) 识别前台进程名
 ///          （只查询进程映像路径，不读写目标进程内存）
-///       2) TSF 输入法 API（读取/激活输入法 profile）
+///       2) TSF 输入法 API（枚举/读取/激活输入法 profile）
 ///   - 这两点与 Windows 自带输入法指示器的能力范围相同。
 ///
 /// 【移植来源】SoundViz.Overlay/ImeAutoSwitcher.cs（TSF 签名按 msctf.h 10.0.26100 核对）。
@@ -23,7 +27,7 @@ namespace ImeSwitcher;
 /// </summary>
 internal static class Program
 {
-    // 目标进程（前台为该进程时切微软拼音）。如需支持其它进程，改这里。
+    // 目标进程（前台为该进程时切换输入法）。如需支持其它进程，改这里。
     private const string TargetProcess = "cs2";
 
     private static readonly Mutex SingleInstance = new(false, "Local\\ImeSwitcher_SingleInstance_20261031");
@@ -50,7 +54,12 @@ internal static class Program
         };
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add("ImeSwitcher v1.0.0", null, (_, _) => { }).Enabled = false;
+
+        // "游戏内输入法"子菜单：打开时动态枚举系统已启用的输入法，勾选当前目标
+        var targetMenu = new ToolStripMenuItem("游戏内输入法");
+        targetMenu.DropDownOpening += (_, _) => RebuildTargetMenu(targetMenu, switcher);
+        menu.Items.Add(targetMenu);
+
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出", null, (_, _) =>
         {
@@ -70,26 +79,41 @@ internal static class Program
         };
         timer.Start();
 
-        Log($"ImeSwitcher 启动：目标进程={TargetProcess}.exe，目标输入法=微软拼音");
+        Log($"ImeSwitcher v1.1.0 启动：目标进程={TargetProcess}.exe");
         Application.Run();
 
         SingleInstance.ReleaseMutex();
+    }
+
+    private static void RebuildTargetMenu(ToolStripMenuItem targetMenu, ImeSwitcherCore switcher)
+    {
+        targetMenu.DropDownItems.Clear();
+
+        targetMenu.DropDownItems.Add(new ToolStripMenuItem(
+            "提示：CS2 内仅微软拼音/谷歌拼音能显示候选词", null, (_, _) => { })
+        { Enabled = false });
+        targetMenu.DropDownItems.Add(new ToolStripSeparator());
+
+        foreach (var (profile, name) in switcher.ListSelectableTargets())
+        {
+            var item = new ToolStripMenuItem(name) { Checked = switcher.IsCurrentTarget(profile) };
+            item.Click += (_, _) => switcher.SetTarget(profile, name);
+            targetMenu.DropDownItems.Add(item);
+        }
     }
 
     // ===== 文件日志 =====
 
     private static readonly object LogLock = new();
 
-    /// <summary>写一行到 %LOCALAPPDATA%\ImeSwitcher\ime_switch.log（与 SoundViz 的日志文件分离）。</summary>
+    /// <summary>写一行到 %LOCALAPPDATA%\ImeSwitcher\ime_switch.log。</summary>
     private static void Log(string msg)
     {
         try
         {
             lock (LogLock)
             {
-                string dir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "ImeSwitcher");
+                string dir = Paths.DataDir;
                 Directory.CreateDirectory(dir);
                 string line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}  {msg}";
                 File.AppendAllText(Path.Combine(dir, "ime_switch.log"), line + Environment.NewLine, Encoding.UTF8);
@@ -99,15 +123,33 @@ internal static class Program
     }
 }
 
+/// <summary>%LOCALAPPDATA%\ImeSwitcher 下的文件路径。</summary>
+internal static class Paths
+{
+    public static string DataDir => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ImeSwitcher");
+    public static string ConfigFile => Path.Combine(DataDir, "config.json");
+    public static string LogFile => Path.Combine(DataDir, "ime_switch.log");
+}
+
+/// <summary>config.json 结构。</summary>
+internal sealed class ConfigData
+{
+    public string Name { get; set; } = "";
+    public string Clsid { get; set; } = "";
+    public string ProfileGuid { get; set; } = "";
+    public ushort LangId { get; set; }
+}
+
 /// <summary>
-/// 输入法自动切换核心：前台进程为目标（cs2）时切微软拼音，离开时恢复进入前的输入法。
+/// 输入法自动切换核心：前台进程为目标（cs2）时切到"游戏内输入法"（默认微软拼音），离开时恢复进入前的输入法。
 /// 移植自 ImeAutoSwitcher.cs，逻辑保持一致：
 ///   - 读取：GetKeyboardLayout 判语言层；TSF GetActiveLanguageProfile 按 CLSID 探测激活状态
 ///   - 切换：ITfInputProcessorProfileMgr::ActivateProfile（FORSESSION | DONTCARECURRENTINPUTLANGUAGE）
 /// </summary>
 internal sealed class ImeSwitcherCore
 {
-    // 目标输入法 CLSID（实测确认，与原版一致）
+    // 默认目标输入法 CLSID（微软拼音，实测确认）
     private static readonly Guid ClsidMicrosoftPinyin = new("81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E");
     private static readonly Guid ClsidWeixin = new("86598FB9-66A2-463E-B9C2-AEB906D477AD");
 
@@ -124,8 +166,9 @@ internal sealed class ImeSwitcherCore
     // 进入目标进程时锁定的"用户原本激活的输入法"，用于离开时恢复
     private string? _beforeEnterClsid;
 
-    // 目标（微软拼音）profile（枚举得到 clsid+guidProfile）
-    private LayoutOrTipProfile? _pinyin;
+    // 游戏内目标输入法（托盘可选，默认微软拼音）
+    private LayoutOrTipProfile? _targetProfile;
+    private string _targetName = "微软拼音";
 
     /// <summary>托盘提示用的状态描述。</summary>
     public string Status { get; private set; } = "ImeSwitcher：运行中";
@@ -147,34 +190,34 @@ internal sealed class ImeSwitcherCore
         {
             if (!_inited)
             {
-                _pinyin = FindTipByClsid(ClsidMicrosoftPinyin);
+                _targetProfile = ResolveTarget();
                 _inited = true;
-                if (_pinyin == null)
+                if (_targetProfile == null)
                 {
-                    Status = "ImeSwitcher：未找到微软拼音";
-                    _log($"初始化失败：枚举不到微软拼音 {ClsidMicrosoftPinyin:B}");
+                    Status = "ImeSwitcher：未找到目标输入法";
+                    _log($"初始化失败：枚举不到目标输入法（默认微软拼音 {ClsidMicrosoftPinyin:B}），且 config.json 指向的输入法不存在");
                     return;
                 }
-                var pinyinInit = _pinyin.Value;
-                _log($"初始化：目标=微软拼音 clsid={ClsidMicrosoftPinyin:B} guid={pinyinInit.ProfileGuid:B}");
+                var t = _targetProfile.Value;
+                _log($"初始化：目标={_targetName} clsid={t.Clsid:B} guid={t.ProfileGuid:B} langid={t.LangId}");
             }
 
-            // _inited 成功后 _pinyin 必非空（失败已提前 return）
-            LayoutOrTipProfile pinyin = _pinyin!.Value;
+            // _inited 成功后 _targetProfile 必非空（失败已提前 return）
+            LayoutOrTipProfile target = _targetProfile!.Value;
 
             bool isTarget = IsTargetForeground();
             if (isTarget && !_inCs2)
             {
-                // 进入目标进程：锁定进入前最后一次记录的输入法，再切微软拼音
+                // 进入目标进程：锁定进入前最后一次记录的输入法，再切游戏内输入法
                 _inCs2 = true;
                 _beforeEnterClsid = _lastNonCs2ActiveClsid;
                 string? cur = GetActiveInputClsid();
                 string curName = DescribeClsid(cur);
                 _log($"切入{_targetProcess}前台：当前输入法=[{curName}] 快照记录=[{(_beforeEnterClsid ?? "无记录")}]");
-                bool ok = ActivateTip(pinyin);
-                Status = ok ? $"ImeSwitcher：进入 {_targetProcess} → 微软拼音"
-                            : "ImeSwitcher：切换微软拼音失败";
-                _log($"进入{_targetProcess}：切微软拼音 {(ok ? "成功" : "失败")}");
+                bool ok = ActivateTip(target);
+                Status = ok ? $"ImeSwitcher：进入 {_targetProcess} → {_targetName}"
+                            : $"ImeSwitcher：切换{_targetName}失败";
+                _log($"进入{_targetProcess}：切{_targetName} {(ok ? "成功" : "失败")}");
             }
             else if (isTarget)
             {
@@ -200,7 +243,7 @@ internal sealed class ImeSwitcherCore
         }
     }
 
-    /// <summary>退出/停用：若处于切入态先恢复原输入法，避免用户被"钉"在微软拼音。</summary>
+    /// <summary>退出/停用：若处于切入态先恢复原输入法，避免用户被"钉"在游戏内输入法。</summary>
     public void Disable()
     {
         if (_inCs2)
@@ -211,6 +254,122 @@ internal sealed class ImeSwitcherCore
         _log("ImeSwitcher：已停用退出");
     }
 
+    // ===== 目标输入法：枚举 / 选择 / 配置 =====
+
+    /// <summary>枚举系统已启用的输入法 profile（TSF 输入处理器类），供托盘菜单选择。</summary>
+    public List<(LayoutOrTipProfile Profile, string Name)> ListSelectableTargets()
+    {
+        var list = new List<(LayoutOrTipProfile, string)>();
+        foreach (var p in GetEnabledProfiles())
+        {
+            if (p.ProfileType != LOTP_INPUTPROCESSOR) continue;
+            list.Add((p, GetProfileDescription(p)));
+        }
+        // 微软拼音排最前（默认推荐）
+        list.Sort((a, b) => Weight(a.Item1.Clsid).CompareTo(Weight(b.Item1.Clsid)));
+        return list;
+
+        static int Weight(Guid clsid) => clsid == ClsidMicrosoftPinyin ? 0 : 1;
+    }
+
+    public bool IsCurrentTarget(LayoutOrTipProfile p) =>
+        _targetProfile != null &&
+        p.Clsid == _targetProfile.Value.Clsid &&
+        p.ProfileGuid == _targetProfile.Value.ProfileGuid;
+
+    /// <summary>托盘选定新目标：保存配置；若此刻在游戏中则立即切换。</summary>
+    public void SetTarget(LayoutOrTipProfile p, string name)
+    {
+        _targetProfile = p;
+        _targetName = name;
+        _inited = true;
+        SaveConfig(p, name);
+        _log($"目标输入法改为：{name} clsid={p.Clsid:B} guid={p.ProfileGuid:B} langid={p.LangId}");
+        if (_inCs2)
+        {
+            bool ok = ActivateTip(p);
+            _log($"游戏内立即切换到 {name}：{(ok ? "成功" : "失败")}");
+        }
+        Status = $"ImeSwitcher：目标={name}";
+    }
+
+    /// <summary>启动时解析目标：优先 config.json（须仍存在），否则默认微软拼音。</summary>
+    private LayoutOrTipProfile? ResolveTarget()
+    {
+        var all = GetEnabledProfiles().Where(p => p.ProfileType == LOTP_INPUTPROCESSOR).ToList();
+
+        var cfg = LoadConfig();
+        if (cfg != null &&
+            Guid.TryParse(cfg.Clsid, out var clsid) &&
+            Guid.TryParse(cfg.ProfileGuid, out var guid))
+        {
+            var found = all.FirstOrDefault(p => p.Clsid == clsid && p.ProfileGuid == guid);
+            if (found.Clsid == clsid)
+            {
+                _targetName = string.IsNullOrWhiteSpace(cfg.Name) ? GetProfileDescription(found) : cfg.Name;
+                _log($"从配置加载目标：{_targetName}");
+                return found;
+            }
+            _log($"config.json 指向的输入法（{cfg.Name}）已不存在，回退默认微软拼音");
+        }
+
+        var def = all.FirstOrDefault(p => p.Clsid == ClsidMicrosoftPinyin);
+        if (def.Clsid == ClsidMicrosoftPinyin)
+        {
+            _targetName = "微软拼音";
+            return def;
+        }
+        return null;
+    }
+
+    private static ConfigData? LoadConfig()
+    {
+        try
+        {
+            if (!File.Exists(Paths.ConfigFile)) return null;
+            return JsonSerializer.Deserialize<ConfigData>(File.ReadAllText(Paths.ConfigFile));
+        }
+        catch { return null; }
+    }
+
+    private void SaveConfig(LayoutOrTipProfile p, string name)
+    {
+        try
+        {
+            Directory.CreateDirectory(Paths.DataDir);
+            var cfg = new ConfigData
+            {
+                Name = name,
+                Clsid = p.Clsid.ToString("D"),
+                ProfileGuid = p.ProfileGuid.ToString("D"),
+                LangId = p.LangId,
+            };
+            File.WriteAllText(Paths.ConfigFile,
+                JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch (Exception ex)
+        {
+            _log($"保存配置失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>取输入法显示名（TSF GetLanguageProfileDescription，槽 10）；失败回退 CLSID 字符串。</summary>
+    private static string GetProfileDescription(LayoutOrTipProfile p)
+    {
+        try
+        {
+            var profiles = (ITfInputProcessorProfiles)new TfInputProcessorProfiles();
+            Guid clsid = p.Clsid, guid = p.ProfileGuid;
+            if (profiles.GetLanguageProfileDescription(ref clsid, p.LangId, ref guid, out var desc) == 0 &&
+                !string.IsNullOrWhiteSpace(desc))
+            {
+                return desc;
+            }
+        }
+        catch { }
+        return p.Clsid.ToString("B");
+    }
+
     private string DescribeClsid(string? clsid) =>
         clsid == null ? "英文键盘"
         : clsid.Equals(ClsidMicrosoftPinyin.ToString(), StringComparison.OrdinalIgnoreCase) ? "微软拼音"
@@ -219,17 +378,18 @@ internal sealed class ImeSwitcherCore
 
     private void RestoreBeforeEnter()
     {
-        bool isPinyin = _beforeEnterClsid == null ||
-                        _beforeEnterClsid.Equals(ClsidMicrosoftPinyin.ToString(), StringComparison.OrdinalIgnoreCase);
-        if (!isPinyin && _beforeEnterClsid != null)
+        bool isTarget = _beforeEnterClsid == null ||
+                        (_targetProfile != null &&
+                         _beforeEnterClsid.Equals(_targetProfile.Value.Clsid.ToString(), StringComparison.OrdinalIgnoreCase));
+        if (!isTarget && _beforeEnterClsid != null)
         {
-            if (TryFindByClsid(_beforeEnterClsid, out var target))
+            if (TryFindByClsid(_beforeEnterClsid, out var restore))
             {
-                bool ok = ActivateTip(target);
-                string targetName = target.Clsid.Equals(ClsidMicrosoftPinyin) ? "微软拼音"
-                    : target.Clsid.Equals(ClsidWeixin) ? "微信" : target.Clsid.ToString("B");
-                Status = ok ? $"ImeSwitcher：已恢复 {targetName}" : "ImeSwitcher：恢复输入法失败";
-                _log($"离开{_targetProcess}：恢复={targetName} {(ok ? "成功" : "失败")}");
+                bool ok = ActivateTip(restore);
+                string restoreName = restore.Clsid.Equals(ClsidMicrosoftPinyin) ? "微软拼音"
+                    : restore.Clsid.Equals(ClsidWeixin) ? "微信" : restore.Clsid.ToString("B");
+                Status = ok ? $"ImeSwitcher：已恢复 {restoreName}" : "ImeSwitcher：恢复输入法失败";
+                _log($"离开{_targetProcess}：恢复={restoreName} {(ok ? "成功" : "失败")}");
             }
             else
             {
@@ -257,8 +417,8 @@ internal sealed class ImeSwitcherCore
         {
             IntPtr hwnd = GetForegroundWindow();
             if (hwnd == IntPtr.Zero) return false;
-            uint pid = GetWindowThreadProcessId(hwnd, out uint p);
-            if (pid == 0 || p == 0) return false;
+            uint tid = GetWindowThreadProcessId(hwnd, out uint p);
+            if (tid == 0 || p == 0) return false;
 
             IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, p);
             if (hProc == IntPtr.Zero) return false;   // 查不到就当不是目标（安全侧）
@@ -281,7 +441,7 @@ internal sealed class ImeSwitcherCore
     // ===== input.dll 枚举（取正确的 clsid+guidProfile 以切换）=====
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct LayoutOrTipProfile
+    internal struct LayoutOrTipProfile
     {
         public uint ProfileType;      // LOTP_INPUTPROCESSOR=1
         public ushort LangId;
@@ -296,8 +456,13 @@ internal sealed class ImeSwitcherCore
 
     private const uint LOTP_INPUTPROCESSOR = 1;
 
-    private static LayoutOrTipProfile? FindTipByClsid(Guid clsid) =>
-        GetEnabledProfiles().FirstOrDefault(p => p.ProfileType == LOTP_INPUTPROCESSOR && p.Clsid == clsid);
+    private static LayoutOrTipProfile? FindTipByClsid(Guid clsid)
+    {
+        foreach (var p in GetEnabledProfiles())
+            if (p.ProfileType == LOTP_INPUTPROCESSOR && p.Clsid == clsid)
+                return p;
+        return null;
+    }
 
     private static bool TryFindByClsid(string clsidStr, out LayoutOrTipProfile profile)
     {
@@ -423,16 +588,17 @@ internal interface ITfInputProcessorProfileMgr
     int ActivateProfile(uint dwProfileType, ushort langId, ref Guid clsid, ref Guid profileGuid, nint hkl, uint dwFlags);
 }
 
-/// <summary>TSF 输入处理器配置：读取用 GetActiveLanguageProfile（槽 8）。</summary>
+/// <summary>TSF 输入处理器配置：读取用 GetActiveLanguageProfile（槽 8）、GetLanguageProfileDescription（槽 10）。</summary>
 [ComImport]
 [Guid("1F02B6C5-7842-4EE6-8A0B-9A24183A95CA")]
 [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 internal interface ITfInputProcessorProfiles
 {
-    // 槽位 0 基顺序需与 msctf.h 一致（仅到用到的 GetActiveLanguageProfile）：
+    // 槽位 0 基顺序需与 msctf.h 一致：
     //   0 Register / 1 Unregister / 2 AddLanguageProfile / 3 RemoveLanguageProfile
     //   4 EnumInputProcessorInfo / 5 GetDefaultLanguageProfile / 6 SetDefaultLanguageProfile
     //   7 ActivateLanguageProfile / 8 GetActiveLanguageProfile
+    //   9 EnumLanguageProfiles / 10 GetLanguageProfileDescription
     [PreserveSig] int Register();
     [PreserveSig] int Unregister();
     [PreserveSig] int AddLanguageProfile();
@@ -443,6 +609,10 @@ internal interface ITfInputProcessorProfiles
     [PreserveSig] int ActivateLanguageProfile();
     [PreserveSig]
     int GetActiveLanguageProfile(ref Guid rclsid, out ushort langid, out Guid guidProfile);
+    [PreserveSig] int EnumLanguageProfiles();   // 槽 9（未使用，占位）
+    [PreserveSig]
+    int GetLanguageProfileDescription(ref Guid rclsid, ushort langid, ref Guid guidProfile,
+        [MarshalAs(UnmanagedType.BStr)] out string pbstrProfileDesc);
 }
 
 /// <summary>TSF 管理器 coclass，同时实现 ITfInputProcessorProfiles 与 ITfInputProcessorProfileMgr。</summary>
